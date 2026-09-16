@@ -1,12 +1,9 @@
 # RoboSense
 
-### Multimodal robot failure detection and reasoning with edge–cloud collaboration
-
-**Anonymous companion repository for double-blind review.**
+### An Edge–Cloud Collaborative Framework for Multimodal Robot Failure Detection
 
 RoboSense combines lightweight edge inference, net-benefit-based cloud routing, and continual cloud-to-edge adaptation for robot execution monitoring. It uses multimodal observations to detect failures and produce structured analyses with temporal localization, supporting evidence, and recovery suggestions.
 
-**Paper:** `[ANONYMOUS_PAPER_URL — replace with the anonymized review copy]`
 
 > **Release status:** This package contains project documentation and a repository scaffold. Implementation, model weights, datasets, and executable reproduction commands are not included. Results below are reported in the manuscript; they have not been reproduced by this package.
 
@@ -108,8 +105,8 @@ For the review version, use this anonymous placeholder. Replace the title, year,
 
 ```bibtex
 @misc{robosense_anonymous,
-  author = {{Anonymous Authors}},
-  title  = {{RoboSense}: [Full paper title]},
+  author = {{}},
+  title  = {{RoboSense}: [An Edge–Cloud Collaborative Framework for Multimodal Robot Failure Detection]},
   year   = {YYYY},
   note   = {Anonymous submission under review},
   url    = {ANONYMOUS_PAPER_URL}
