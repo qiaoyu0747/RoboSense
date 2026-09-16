@@ -1,0 +1,46 @@
+# Python and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*
+secrets*
+configs/local.*
+
+# Local data, model artifacts, and experiment outputs
+data/*
+!data/README.md
+checkpoints/
+weights/
+outputs/
+runs/
+logs/
+wandb/
+*.log
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Editors, OS metadata, and notebook checkpoints
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+.ipynb_checkpoints/
+*~
+*.swp
