@@ -52,7 +52,7 @@ export ROBOSENSE_CLOUD_MODEL=Qwen/Qwen2.5-Omni-7B
 export ROBOSENSE_SENSOR_PRETRAINED=/path/to/reassemble_sensor_encoder.pt
 ```
 
-Register the dataset names referenced by `configs/*.yaml` in LLaMA-Factory's `dataset_info.json`. See [data format](docs/DATA_FORMAT.md) and [configuration](docs/CONFIGURATION.md).
+Register the dataset names referenced by `configs/*.yaml` in LLaMA-Factory's `dataset_info.json`.
 
 ## Commands
 
@@ -80,10 +80,6 @@ The generated feedback and replay records are consumed by the patched LLaMA-Fact
 ## Third-party software
 
 RoboSense builds on [Qwen2.5-Omni](https://huggingface.co/collections/Qwen/qwen25-omni-67de7e5e3ba8e47b585c5eb8). Their respective licenses and model terms continue to apply. Dataset licenses are not changed by this code release.
-
-## Citation
-
-The paper citation will be added after publication. For the software release, use [citation.bib](citation.bib).
 
 ## License
 
