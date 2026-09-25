@@ -79,7 +79,7 @@ The generated feedback and replay records are consumed by the patched LLaMA-Fact
 
 ## Third-party software
 
-RoboSense builds on [Qwen2.5-Omni](https://huggingface.co/collections/Qwen/qwen25-omni-67de7e5e3ba8e47b585c5eb8) and [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory). Their respective licenses and model terms continue to apply. Dataset licenses are not changed by this code release.
+RoboSense builds on [Qwen2.5-Omni](https://huggingface.co/collections/Qwen/qwen25-omni-67de7e5e3ba8e47b585c5eb8). Their respective licenses and model terms continue to apply. Dataset licenses are not changed by this code release.
 
 ## Citation
 
