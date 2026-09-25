@@ -1,0 +1,1092 @@
+diff --git a/src/llamafactory/data/__init__.py b/src/llamafactory/data/__init__.py
+index 0848ae14..2451f8e8 100644
+--- a/src/llamafactory/data/__init__.py
++++ b/src/llamafactory/data/__init__.py
+@@ -15,6 +15,7 @@
+ from .collator import (
+     KTODataCollatorWithPadding,
+     MultiModalDataCollatorForSeq2Seq,
++    MultimodalAuxiliarySFTDataCollatorWith4DAttentionMask,
+     PairwiseDataCollatorWithPadding,
+     SensorFusionSFTDataCollatorWith4DAttentionMask,
+     SFTDataCollatorWith4DAttentionMask,
+@@ -28,6 +29,7 @@ __all__ = [
+     "TEMPLATES",
+     "KTODataCollatorWithPadding",
+     "MultiModalDataCollatorForSeq2Seq",
++    "MultimodalAuxiliarySFTDataCollatorWith4DAttentionMask",
+     "PairwiseDataCollatorWithPadding",
+     "Role",
+     "SensorFusionSFTDataCollatorWith4DAttentionMask",
+diff --git a/src/llamafactory/data/collator.py b/src/llamafactory/data/collator.py
+index 362358b7..f021a3a8 100755
+--- a/src/llamafactory/data/collator.py
++++ b/src/llamafactory/data/collator.py
+@@ -263,6 +263,35 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
+         return features
+ 
+ 
++@dataclass
++class MultimodalAuxiliarySFTDataCollatorWith4DAttentionMask(SFTDataCollatorWith4DAttentionMask):
++    r"""Batch auxiliary detection and KD metadata without requiring a sensor field."""
++
++    def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
++        metadata = {
++            "anomaly_labels": ([feature.pop("anomaly", None) for feature in features], torch.float32),
++            "teacher_scores": ([feature.pop("teacher_score", None) for feature in features], torch.float32),
++            "task_labels": ([feature.pop("task_label", None) for feature in features], torch.long),
++            "action_labels": ([feature.pop("action_label", None) for feature in features], torch.long),
++            "object_labels": ([feature.pop("object_label", None) for feature in features], torch.long),
++            "active_task_masks": ([feature.pop("active_task_mask", None) for feature in features], torch.bool),
++            "previous_edge_scores": ([feature.pop("previous_edge_score", None) for feature in features], torch.float32),
++            "teacher_embeddings": ([feature.pop("teacher_embedding", None) for feature in features], torch.float32),
++            "teacher_quality_weights": ([feature.pop("teacher_quality_weight", None) for feature in features], torch.float32),
++            "disagreement_labels": ([feature.pop("disagreement_label", None) for feature in features], torch.float32),
++            "replay_labels": ([feature.pop("replay_label", None) for feature in features], torch.float32),
++        }
++        if any("sensor" in feature and feature["sensor"] is not None for feature in features):
++            raise ValueError("Sensorless multimodal auxiliary batches must not contain a `sensor` field.")
++        for feature in features:
++            feature.pop("sensor", None)
++        batch = super().__call__(features)
++        for name, (values, dtype) in metadata.items():
++            if all(value is not None for value in values):
++                batch[name] = torch.tensor(values, dtype=dtype)
++        return batch
++
++
+ @dataclass
+ class SensorFusionSFTDataCollatorWith4DAttentionMask(SFTDataCollatorWith4DAttentionMask):
+     r"""SFT collator that loads fixed-shape robot tensors and marks sensor placeholders."""
+@@ -283,6 +312,7 @@ class SensorFusionSFTDataCollatorWith4DAttentionMask(SFTDataCollatorWith4DAttent
+         teacher_embeddings = [feature.pop("teacher_embedding", None) for feature in features]
+         teacher_quality_weights = [feature.pop("teacher_quality_weight", None) for feature in features]
+         disagreement_labels = [feature.pop("disagreement_label", None) for feature in features]
++        replay_labels = [feature.pop("replay_label", None) for feature in features]
+         if any(path is None for path in sensor_paths):
+             raise ValueError("Sensor fusion requires one `sensor` tensor path per sample.")
+         batch = super().__call__(features)
+@@ -314,6 +344,7 @@ class SensorFusionSFTDataCollatorWith4DAttentionMask(SFTDataCollatorWith4DAttent
+             (teacher_embeddings, "teacher_embeddings", torch.float32),
+             (teacher_quality_weights, "teacher_quality_weights", torch.float32),
+             (disagreement_labels, "disagreement_labels", torch.float32),
++            (replay_labels, "replay_labels", torch.float32),
+         ]:
+             if all(value is not None for value in values):
+                 batch[name] = torch.tensor(values, dtype=dtype)
+diff --git a/src/llamafactory/data/converter.py b/src/llamafactory/data/converter.py
+index 227d6303..1cb25887 100755
+--- a/src/llamafactory/data/converter.py
++++ b/src/llamafactory/data/converter.py
+@@ -138,6 +138,7 @@ class AlpacaDatasetConverter(DatasetConverter):
+             "_teacher_embedding": example.get(self.dataset_attr.teacher_embeddings) if self.dataset_attr.teacher_embeddings else None,
+             "_teacher_quality_weight": example.get(self.dataset_attr.teacher_quality_weights) if self.dataset_attr.teacher_quality_weights else None,
+             "_disagreement_label": example.get(self.dataset_attr.disagreement_labels) if self.dataset_attr.disagreement_labels else None,
++            "_replay_label": example.get(self.dataset_attr.replay_labels) if self.dataset_attr.replay_labels else None,
+         }
+         return output
+ 
+diff --git a/src/llamafactory/data/mm_plugin.py b/src/llamafactory/data/mm_plugin.py
+index be8cea9d..4e33c087 100644
+--- a/src/llamafactory/data/mm_plugin.py
++++ b/src/llamafactory/data/mm_plugin.py
+@@ -1656,6 +1656,129 @@ class GLM4VPlugin(Qwen2VLPlugin):
+ 
+ 
+ class Qwen2OmniPlugin(Qwen2VLPlugin):
++    def _get_audio_metadata_lengths(
++        self, audios: list["AudioInput"], processor: "MMProcessor"
++    ) -> list[int]:
++        r"""Derive Omni audio-token lengths without calculating log-Mel features."""
++        feature_extractor: SequenceFeatureExtractor = getattr(processor, "feature_extractor", None)
++        target_rate: int = getattr(processor, "audio_sampling_rate", 16000)
++        hop_length: int = getattr(feature_extractor, "hop_length", 160)
++        max_samples: int = getattr(feature_extractor, "n_samples", 4800000)
++        lengths = []
++        for audio in audios:
++            if isinstance(audio, np.ndarray):
++                sample_count = int(audio.shape[-1])
++            elif isinstance(audio, (str, os.PathLike)):
++                import soundfile as sf
++
++                info = sf.info(audio)
++                # librosa.resample(..., fix=True) pads/trims to ceil(target length).
++                sample_count = math.ceil(info.frames * target_rate / info.samplerate)
++            else:
++                # File-like inputs do not have a stable metadata contract, so retain
++                # the exact original preprocessing as a conservative fallback.
++                regularized = self._regularize_audios([audio], sampling_rate=target_rate)["audios"]
++                sample_count = int(regularized[0].shape[-1])
++
++            sample_count = min(sample_count, max_samples)
++            feature_mask_length = math.ceil(sample_count / hop_length)
++            input_length = (feature_mask_length - 1) // 2 + 1
++            lengths.append((input_length - 2) // 2 + 1)
++
++        return lengths
++
++    def _get_video_metadata_inputs(
++        self, videos: list["VideoInput"], processor: "MMProcessor"
++    ) -> dict[str, "torch.Tensor"]:
++        r"""Compute Qwen video token grids without decoding video frames.
++
++        ``process_messages`` only needs the spatial/temporal grid to expand the
++        video placeholder.  Decoding pixels at that stage is redundant because
++        the multimodal collator decodes them again immediately before the model
++        forward.  This opt-in path derives the exact grid from container metadata
++        and falls back to the regular processor for non-file video inputs.
++        """
++        image_processor: BaseImageProcessor = getattr(processor, "image_processor", None)
++        patch_size: int = getattr(image_processor, "patch_size", 14)
++        temporal_patch_size: int = getattr(image_processor, "temporal_patch_size", 2)
++        merge_size: int = getattr(image_processor, "merge_size", 2)
++        processor_size = getattr(image_processor, "size", {})
++        min_pixels: int = processor_size.get("shortest_edge", 56 * 56)
++        max_pixels: int = processor_size.get("longest_edge", 14 * 14 * 4 * 1280)
++        regularize_max: int = getattr(processor, "video_max_pixels", 256 * 256)
++        regularize_min: int = getattr(processor, "video_min_pixels", 16 * 16)
++        video_fps: float = getattr(processor, "video_fps", 2.0)
++        video_maxlen: int = getattr(processor, "video_maxlen", 128)
++
++        # Keep the resizing calculation in one place with Transformers, whose
++        # Qwen implementation defines the token-grid rounding contract.
++        from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
++
++        grids, seconds_per_grid = [], []
++        for video in videos:
++            if _check_video_is_nested_images(video) or not isinstance(video, (str, os.PathLike)):
++                fallback = self._get_mm_inputs([], [video], [], processor)
++                grids.append(fallback["video_grid_thw"][0])
++                seconds_per_grid.append(fallback["video_second_per_grid"][0])
++                continue
++
++            container = av.open(video, "r")
++            try:
++                video_stream = next(stream for stream in container.streams if stream.type == "video")
++                sample_indices = self._get_video_sample_indices(
++                    video_stream, video_fps=video_fps, video_maxlen=video_maxlen
++                )
++                frame_count = len(sample_indices)
++                if frame_count % 2 != 0:
++                    frame_count += 1
++
++                width, height = int(video_stream.width), int(video_stream.height)
++                area = width * height
++                if area > regularize_max:
++                    scale = math.sqrt(regularize_max / area)
++                    width, height = int(width * scale), int(height * scale)
++                elif area < regularize_min:
++                    scale = math.sqrt(regularize_min / area)
++                    width, height = int(width * scale), int(height * scale)
++
++                width, height = max(width, 28), max(height, 28)
++                if width / height > 200:
++                    width = height * 180
++                elif height / width > 200:
++                    height = width * 180
++
++                resized_height, resized_width = smart_resize(
++                    height,
++                    width,
++                    factor=patch_size * merge_size,
++                    min_pixels=min_pixels,
++                    max_pixels=max_pixels,
++                )
++                grids.append(
++                    torch.tensor(
++                        [
++                            frame_count // temporal_patch_size,
++                            resized_height // patch_size,
++                            resized_width // patch_size,
++                        ],
++                        dtype=torch.long,
++                    )
++                )
++                duration = (
++                    float(video_stream.duration * video_stream.time_base)
++                    if video_stream.duration is not None
++                    else None
++                )
++                sampled_fps = frame_count / duration if duration else video_fps
++                seconds_per_grid.append(torch.tensor(temporal_patch_size / sampled_fps))
++            finally:
++                container.close()
++
++        return {
++            "video_grid_thw": torch.stack(grids) if grids else torch.empty((0, 3), dtype=torch.long),
++            "video_second_per_grid": torch.stack(seconds_per_grid) if seconds_per_grid else torch.empty(0),
++        }
++
+     @override
+     def _get_mm_inputs(
+         self,
+@@ -1683,7 +1806,27 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
+                 video_fps=getattr(processor, "video_fps", 2.0),
+                 video_maxlen=getattr(processor, "video_maxlen", 128),
+             )
+-            mm_inputs.update(image_processor(images=None, videos=video_dict["videos"], return_tensors="pt"))
++            # Qwen2VLImageProcessorFast groups videos by spatial dimensions only.
++            # When a batch contains clips with different frame counts it then
++            # attempts torch.stack([T1,C,H,W], [T2,C,H,W]) and fails. Processing
++            # each clip independently still returns the documented concatenated
++            # patch tensor and per-video grid while supporting multimodal batch>1.
++            video_processor_kwargs = {
++                "images": None,
++                "videos": video_dict["videos"],
++                "return_tensors": "pt",
++            }
++            try:
++                processed_videos = image_processor(disable_grouping=True, **video_processor_kwargs)
++            except TypeError as error:
++                # ``disable_grouping`` is implemented by the fast image processor,
++                # but older/slow Qwen processors reject it.  Batch-one prediction
++                # does not need grouping, so retry without the optional argument.
++                if "disable_grouping" not in str(error):
++                    raise
++                processed_videos = image_processor(**video_processor_kwargs)
++
++            mm_inputs.update(processed_videos)
+             temporal_patch_size: int = getattr(image_processor, "temporal_patch_size", 2)
+             mm_inputs["video_second_per_grid"] = torch.tensor(
+                 [temporal_patch_size / fps for fps in video_dict["fps_per_video"]]
+@@ -1725,7 +1868,15 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
+         merge_length = processor.image_processor.merge_size**2
+         use_audio_in_video = getattr(processor, "use_audio_in_video", False)
+         if self.expand_mm_tokens:
+-            mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
++            if os.getenv("LLAMAFACTORY_METADATA_ONLY_VIDEO_TOKENS") == "1" and len(videos) != 0:
++                # Images and audio still require their native processors; only
++                # media token counts are derived from container metadata. Pixel and
++                # log-Mel tensors are still produced by the collator for inference.
++                mm_inputs = self._get_mm_inputs(images, [], [], processor)
++                mm_inputs.update(self._get_video_metadata_inputs(videos, processor))
++                audio_lengths = self._get_audio_metadata_lengths(audios, processor)
++            else:
++                mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
+             image_grid_thw = mm_inputs.get("image_grid_thw", [])
+             video_grid_thw = mm_inputs.get("video_grid_thw", [])
+             if "feature_attention_mask" in mm_inputs:
+diff --git a/src/llamafactory/data/parser.py b/src/llamafactory/data/parser.py
+index 927f7914..7348fd37 100644
+--- a/src/llamafactory/data/parser.py
++++ b/src/llamafactory/data/parser.py
+@@ -54,6 +54,7 @@ class DatasetAttr:
+     teacher_embeddings: Optional[str] = None
+     teacher_quality_weights: Optional[str] = None
+     disagreement_labels: Optional[str] = None
++    replay_labels: Optional[str] = None
+     # dpo columns
+     chosen: Optional[str] = None
+     rejected: Optional[str] = None
+@@ -94,7 +95,7 @@ class DatasetAttr:
+                 "images", "videos", "audios", "sensors", "anomalies", "teacher_scores",
+                 "task_labels", "action_labels", "object_labels", "active_task_masks",
+                 "previous_edge_scores", "teacher_embeddings", "teacher_quality_weights",
+-                "disagreement_labels", "chosen", "rejected", "kto_tag",
++                "disagreement_labels", "replay_labels", "chosen", "rejected", "kto_tag",
+             ]
+             for column_name in column_names:
+                 self.set_attr(column_name, attr["columns"])
+diff --git a/src/llamafactory/data/processor/supervised.py b/src/llamafactory/data/processor/supervised.py
+index 9bed3d34..e1d49eca 100755
+--- a/src/llamafactory/data/processor/supervised.py
++++ b/src/llamafactory/data/processor/supervised.py
+@@ -126,9 +126,9 @@ class SupervisedDatasetProcessor(DatasetProcessor):
+             model_inputs["audios"].append(examples["_audios"][i])
+             if has_sensor:
+                 model_inputs["sensor"].append(_col(examples, "sensor", i))
+-            if has_sensor and examples.get("_anomaly") is not None:
++            if examples.get("_anomaly") is not None:
+                 model_inputs["anomaly"].append(_col(examples, "_anomaly", i))
+-            if has_sensor and examples.get("_teacher_score") is not None:
++            if examples.get("_teacher_score") is not None:
+                 model_inputs["teacher_score"].append(_col(examples, "_teacher_score", i))
+             for source, target in [
+                 ("_task_label", "task_label"),
+@@ -139,8 +139,9 @@ class SupervisedDatasetProcessor(DatasetProcessor):
+                 ("_teacher_embedding", "teacher_embedding"),
+                 ("_teacher_quality_weight", "teacher_quality_weight"),
+                 ("_disagreement_label", "disagreement_label"),
++                ("_replay_label", "replay_label"),
+             ]:
+-                if has_sensor and examples.get(source) is not None:
++                if examples.get(source) is not None:
+                     model_inputs[target].append(_col(examples, source, i))
+ 
+             # add:
+diff --git a/src/llamafactory/data/processor/unsupervised.py b/src/llamafactory/data/processor/unsupervised.py
+index 6e612bb3..7d3ed13a 100644
+--- a/src/llamafactory/data/processor/unsupervised.py
++++ b/src/llamafactory/data/processor/unsupervised.py
+@@ -95,9 +95,9 @@ class UnsupervisedDatasetProcessor(DatasetProcessor):
+             model_inputs["audios"].append(examples["_audios"][i])
+             if has_sensor:
+                 model_inputs["sensor"].append(_col(examples, "sensor", i))
+-            if has_sensor and examples.get("_anomaly") is not None:
++            if examples.get("_anomaly") is not None:
+                 model_inputs["anomaly"].append(_col(examples, "_anomaly", i))
+-            if has_sensor and examples.get("_teacher_score") is not None:
++            if examples.get("_teacher_score") is not None:
+                 model_inputs["teacher_score"].append(_col(examples, "_teacher_score", i))
+             for source, target in [
+                 ("_task_label", "task_label"),
+@@ -107,9 +107,10 @@ class UnsupervisedDatasetProcessor(DatasetProcessor):
+                 ("_previous_edge_score", "previous_edge_score"),
+                 ("_teacher_embedding", "teacher_embedding"),
+                 ("_teacher_quality_weight", "teacher_quality_weight"),
++                ("_replay_label", "replay_label"),
+                 ("_disagreement_label", "disagreement_label"),
+             ]:
+-                if has_sensor and examples.get(source) is not None:
++                if examples.get(source) is not None:
+                     model_inputs[target].append(_col(examples, source, i))
+             # ... after the existing appends:
+             model_inputs["id"].append(_col(examples, "id", i))
+diff --git a/src/llamafactory/hparams/model_args.py b/src/llamafactory/hparams/model_args.py
+index 3dea172e..4f7b4a85 100644
+--- a/src/llamafactory/hparams/model_args.py
++++ b/src/llamafactory/hparams/model_args.py
+@@ -79,6 +79,15 @@ class BaseModelArguments:
+         default=False,
+         metadata={"help": "Whether to inject learned robot time-series tokens into the language model."},
+     )
++    multimodal_auxiliary_head: bool = field(
++        default=False,
++        metadata={
++            "help": (
++                "Pool the video/audio/text hidden state for anomaly, task, and distillation heads "
++                "without requiring sensor inputs."
++            )
++        },
++    )
+     sensor_token: str = field(
+         default="<|fim_pad|>",
+         metadata={"help": "Special placeholder token replaced by learned sensor embeddings."},
+@@ -156,6 +165,22 @@ class BaseModelArguments:
+         default=1.0,
+         metadata={"help": "Temperature used to soften binary student and teacher logits during distillation."},
+     )
++    language_model_loss_weight: float = field(
++        default=1.0,
++        metadata={"help": "Weight of the token-level language-model loss."},
++    )
++    replay_loss_weight: float = field(
++        default=0.0,
++        metadata={"help": "Weight of replay-label BCE for offline feedback adaptation."},
++    )
++    replay_consistency_weight: float = field(
++        default=0.5,
++        metadata={"help": "Within-replay weight for preserving frozen pre-update edge probabilities."},
++    )
++    freeze_loaded_adapter_modules_to_save: bool = field(
++        default=False,
++        metadata={"help": "Freeze inherited PEFT modules_to_save while updating LoRA and newly attached heads."},
++    )
+     consistency_loss_weight: float = field(
+         default=0.0,
+         metadata={"help": "Weight of paired full-versus-missing-sensor anomaly-score consistency loss."},
+@@ -268,6 +293,9 @@ class BaseModelArguments:
+         if self.split_special_tokens and self.use_fast_tokenizer:
+             raise ValueError("`split_special_tokens` is only supported for slow tokenizers.")
+ 
++        if self.sensor_fusion and self.multimodal_auxiliary_head:
++            raise ValueError("Enable either `sensor_fusion` or `multimodal_auxiliary_head`, not both.")
++
+         if self.adapter_name_or_path is not None:  # support merging multiple lora weights
+             self.adapter_name_or_path = [path.strip() for path in self.adapter_name_or_path.split(",")]
+ 
+diff --git a/src/llamafactory/model/model_utils/sensor_fusion.py b/src/llamafactory/model/model_utils/sensor_fusion.py
+index d52fb77d..ee2071c2 100644
+--- a/src/llamafactory/model/model_utils/sensor_fusion.py
++++ b/src/llamafactory/model/model_utils/sensor_fusion.py
+@@ -11,6 +11,7 @@ from torch import nn
+ from torch.nn import functional as F
+ 
+ from ...extras.constants import IGNORE_INDEX
++from .feedback_distillation import binary_soft_target_kd, replay_detection_loss
+ 
+ 
+ class SensorTokenEncoder(nn.Module):
+@@ -89,6 +90,16 @@ def compute_anomaly_pool_positions(labels: torch.Tensor, attention_mask: Optiona
+     return torch.where(has_supervision, positions, fallback)
+ 
+ 
++def _masked_ce(logits: torch.Tensor, labels: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
++    if labels is None:
++        return None
++    labels = labels.long().to(logits.device)
++    valid = labels.ge(0)
++    if not valid.any():
++        return None
++    return F.cross_entropy(logits[valid], labels[valid])
++
++
+ def attach_sensor_fusion(
+     model: nn.Module,
+     input_dim: int = 52,
+@@ -120,6 +131,9 @@ def attach_sensor_fusion(
+     distillation_temperature: float = 1.0,
+     consistency_loss_weight: float = 0.0,
+     consistency_sensor_dropout_probability: float = 0.0,
++    language_model_loss_weight: float = 1.0,
++    replay_loss_weight: float = 0.0,
++    replay_consistency_weight: float = 0.5,
+ ) -> nn.Module:
+     """Attach a trainable sensor encoder and patch forward to inject its tokens."""
+ 
+@@ -154,6 +168,9 @@ def attach_sensor_fusion(
+     model.reassemble_distillation_temperature = distillation_temperature
+     model.reassemble_consistency_loss_weight = consistency_loss_weight
+     model.reassemble_consistency_sensor_dropout_probability = consistency_sensor_dropout_probability
++    model.reassemble_language_model_loss_weight = language_model_loss_weight
++    model.reassemble_replay_loss_weight = replay_loss_weight
++    model.reassemble_replay_consistency_weight = replay_consistency_weight
+     model.reassemble_sensor_learning_rate = sensor_learning_rate
+     original_forward = model.forward
+ 
+@@ -173,6 +190,7 @@ def attach_sensor_fusion(
+         teacher_embeddings=None,
+         teacher_quality_weights=None,
+         disagreement_labels=None,
++        replay_labels=None,
+         anomaly_pool_positions=None,
+         return_anomaly_logits=False,
+         return_fused_embedding=False,
+@@ -240,7 +258,17 @@ def attach_sensor_fusion(
+                     task_embedding = F.normalize(this.reassemble_task_projection(fused.float()), dim=-1)
+                     task_logits = this.reassemble_task_classifier(task_embedding)
+                     if active_task_masks is not None:
+-                        mask = active_task_masks.bool().to(task_logits.device)
++                        mask = active_task_masks.bool().to(task_logits.device).clone()
++                        # OOD feedback can introduce a labelled task that was not in
++                        # the initial checkpoint's active-task set.  Keep the mask for
++                        # all other classes, but never mask the supervised target: CE
++                        # on a masked target otherwise becomes +inf in BF16.
++                        if this.training and task_labels is not None:
++                            targets = task_labels.long().to(task_logits.device)
++                            valid = targets.ge(0) & targets.lt(mask.shape[-1])
++                            if valid.any():
++                                rows = torch.arange(mask.shape[0], device=mask.device)[valid]
++                                mask[rows, targets[valid]] = True
+                         task_logits = task_logits.masked_fill(~mask, torch.finfo(task_logits.dtype).min)
+                     action_logits = this.reassemble_action_classifier(task_embedding)
+                     object_logits = this.reassemble_object_classifier(task_embedding)
+@@ -255,44 +283,45 @@ def attach_sensor_fusion(
+                         "disagreement_logits": disagreement_logits,
+                     })
+                 if kwargs.get("labels") is not None:
+-                    positive_weight = anomaly_logits.new_tensor(float(this.reassemble_anomaly_positive_weight))
+-                    anomaly_loss = F.binary_cross_entropy_with_logits(anomaly_logits, labels_float, pos_weight=positive_weight)
+-                    sensor_loss = F.binary_cross_entropy_with_logits(sensor_logits, labels_float, pos_weight=positive_weight)
+-                    outputs["loss"] = (
+-                        outputs["loss"]
+-                        + this.reassemble_anomaly_loss_weight * anomaly_loss
+-                        + this.reassemble_sensor_loss_weight * sensor_loss
+-                    )
++                    if this.reassemble_language_model_loss_weight == 0:
++                        # Multiplying a NaN/Inf language loss by zero is still NaN.
++                        # The feedback objective intentionally disables generation,
++                        # so construct a graph-connected exact zero instead.
++                        outputs["loss"] = anomaly_logits.float().sum() * 0.0
++                    else:
++                        outputs["loss"] = outputs["loss"] * this.reassemble_language_model_loss_weight
++                    valid_supervised = labels_float.ge(0)
++                    if valid_supervised.any():
++                        positive_weight = anomaly_logits.new_tensor(float(this.reassemble_anomaly_positive_weight))
++                        anomaly_loss = F.binary_cross_entropy_with_logits(
++                            anomaly_logits[valid_supervised], labels_float[valid_supervised], pos_weight=positive_weight
++                        )
++                        sensor_loss = F.binary_cross_entropy_with_logits(
++                            sensor_logits[valid_supervised], labels_float[valid_supervised], pos_weight=positive_weight
++                        )
++                        outputs["loss"] = (
++                            outputs["loss"]
++                            + this.reassemble_anomaly_loss_weight * anomaly_loss
++                            + this.reassemble_sensor_loss_weight * sensor_loss
++                        )
+                     if task_embedding is not None:
+-                        if task_labels is not None:
+-                            outputs["loss"] = outputs["loss"] + this.reassemble_task_loss_weight * F.cross_entropy(
+-                                task_logits, task_labels.long().to(task_logits.device)
+-                            )
+-                        if action_labels is not None:
+-                            outputs["loss"] = outputs["loss"] + this.reassemble_action_loss_weight * F.cross_entropy(
+-                                action_logits, action_labels.long().to(action_logits.device)
+-                            )
+-                        if object_labels is not None:
+-                            outputs["loss"] = outputs["loss"] + this.reassemble_object_loss_weight * F.cross_entropy(
+-                                object_logits, object_labels.long().to(object_logits.device)
+-                            )
++                        for logits, targets, weight in (
++                            (task_logits, task_labels, this.reassemble_task_loss_weight),
++                            (action_logits, action_labels, this.reassemble_action_loss_weight),
++                            (object_logits, object_labels, this.reassemble_object_loss_weight),
++                        ):
++                            auxiliary_loss = _masked_ce(logits, targets)
++                            if auxiliary_loss is not None:
++                                outputs["loss"] = outputs["loss"] + weight * auxiliary_loss
+                         if this.training and disagreement_labels is not None and this.reassemble_disagreement_loss_weight > 0:
+                             outputs["loss"] = outputs["loss"] + this.reassemble_disagreement_loss_weight * F.binary_cross_entropy_with_logits(
+                                 disagreement_logits, disagreement_labels.float().to(disagreement_logits.device)
+                             )
+                     if this.training and teacher_scores is not None and this.reassemble_distillation_loss_weight > 0:
+                         temperature = max(float(this.reassemble_distillation_temperature), 1e-6)
+-                        teacher_prob = teacher_scores.float().to(anomaly_logits.device).clamp(1e-6, 1 - 1e-6)
+-                        teacher_logits = torch.logit(teacher_prob)
+-                        softened_teacher = torch.sigmoid(teacher_logits / temperature)
+-                        per_sample_kd = F.binary_cross_entropy_with_logits(
+-                            anomaly_logits / temperature, softened_teacher, reduction="none"
++                        distillation_loss = binary_soft_target_kd(
++                            anomaly_logits, teacher_scores, temperature, teacher_quality_weights
+                         )
+-                        if teacher_quality_weights is not None:
+-                            weights = teacher_quality_weights.float().to(per_sample_kd.device).clamp_min(0)
+-                            distillation_loss = (per_sample_kd * weights).sum() / weights.sum().clamp_min(1e-6)
+-                        else:
+-                            distillation_loss = per_sample_kd.mean()
+                         outputs["loss"] = (
+                             outputs["loss"]
+                             + this.reassemble_distillation_loss_weight * (temperature**2) * distillation_loss
+@@ -304,6 +333,13 @@ def attach_sensor_fusion(
+                             outputs["loss"] = outputs["loss"] + this.reassemble_previous_edge_consistency_loss_weight * F.mse_loss(
+                                 torch.sigmoid(anomaly_logits[protected]), previous[protected]
+                             )
++                    if this.training and replay_labels is not None and this.reassemble_replay_loss_weight > 0:
++                        replay_loss = replay_detection_loss(
++                            anomaly_logits, replay_labels, previous_edge_scores,
++                            positive_weight=this.reassemble_anomaly_positive_weight,
++                            consistency_weight=this.reassemble_replay_consistency_weight,
++                        )
++                        outputs["loss"] = outputs["loss"] + this.reassemble_replay_loss_weight * replay_loss
+                     if this.training and teacher_embeddings is not None and this.reassemble_relation_distillation_loss_weight > 0:
+                         student_embed = F.normalize(fused.float(), dim=-1)
+                         teacher_embed = F.normalize(teacher_embeddings.float().to(student_embed.device), dim=-1)
+diff --git a/src/llamafactory/train/sft/trainer.py b/src/llamafactory/train/sft/trainer.py
+index 1eda424c..65074337 100644
+--- a/src/llamafactory/train/sft/trainer.py
++++ b/src/llamafactory/train/sft/trainer.py
+@@ -30,6 +30,10 @@ from ...extras import logging
+ from ...extras.constants import IGNORE_INDEX
+ from ...extras.packages import is_transformers_version_greater_than
+ from ...model.model_utils.sensor_fusion import compute_anomaly_pool_positions, load_sensor_fusion, save_sensor_fusion
++from ...model.model_utils.multimodal_auxiliary import (
++    load_multimodal_auxiliary_heads,
++    save_multimodal_auxiliary_heads,
++)
+ from ..callbacks import SaveProcessorCallback
+ from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
+ 
+@@ -152,6 +156,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+         if hasattr(unwrapped_model, "reassemble_sensor_fusion"):
+             checkpoint_dir = os.path.join(self.args.output_dir, f"checkpoint-{self.state.global_step}")
+             save_sensor_fusion(unwrapped_model, checkpoint_dir)
++        elif hasattr(unwrapped_model, "reassemble_multimodal_auxiliary_heads"):
++            checkpoint_dir = os.path.join(self.args.output_dir, f"checkpoint-{self.state.global_step}")
++            save_multimodal_auxiliary_heads(unwrapped_model, checkpoint_dir)
+ 
+     @override
+     def _load_best_model(self) -> None:
+@@ -159,6 +166,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+         unwrapped_model = self.accelerator.unwrap_model(self.model)
+         if self.state.best_model_checkpoint and hasattr(unwrapped_model, "reassemble_sensor_fusion"):
+             load_sensor_fusion(unwrapped_model, self.state.best_model_checkpoint)
++        elif self.state.best_model_checkpoint and hasattr(unwrapped_model, "reassemble_multimodal_auxiliary_heads"):
++            load_multimodal_auxiliary_heads(unwrapped_model, self.state.best_model_checkpoint)
+ 
+     @override
+     def prediction_step(
+@@ -232,6 +241,27 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+ 
+         if self.args.predict_with_generate:  # do not pass labels to model when generate
+             labels = inputs.pop("labels", None)
++            # Auxiliary supervision is consumed by the explicit scoring forward
++            # pass above. Do not forward it into ``generate``: generation retains
++            # arbitrary model kwargs across decoding steps, where fixed pooling
++            # positions and labels no longer match the one-token cached state.
++            for key in (
++                "anomaly_labels",
++                "teacher_scores",
++                "task_labels",
++                "action_labels",
++                "object_labels",
++                "active_task_masks",
++                "previous_edge_scores",
++                "teacher_embeddings",
++                "teacher_quality_weights",
++                "disagreement_labels",
++                "replay_labels",
++                "anomaly_pool_positions",
++                "return_anomaly_logits",
++                "return_fused_embedding",
++            ):
++                inputs.pop(key, None)
+         else:
+             labels = inputs.get("labels")
+ 
+diff --git a/src/llamafactory/train/sft/workflow.py b/src/llamafactory/train/sft/workflow.py
+index dce609cc..e0d599a6 100644
+--- a/src/llamafactory/train/sft/workflow.py
++++ b/src/llamafactory/train/sft/workflow.py
+@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Optional
+ 
+ from ...data import (
+     SFTDataCollatorWith4DAttentionMask,
++    MultimodalAuxiliarySFTDataCollatorWith4DAttentionMask,
+     SensorFusionSFTDataCollatorWith4DAttentionMask,
+     get_dataset,
+     get_template_and_fix_tokenizer,
+@@ -29,6 +30,10 @@ from ...extras.misc import calculate_tps
+ from ...extras.ploting import plot_loss
+ from ...model import load_model, load_tokenizer
+ from ...model.model_utils.sensor_fusion import attach_sensor_fusion, save_sensor_fusion
++from ...model.model_utils.multimodal_auxiliary import (
++    attach_multimodal_auxiliary_heads,
++    save_multimodal_auxiliary_heads,
++)
+ from ..trainer_utils import create_modelcard_and_push
+ from .metric import ComputeAccuracy, ComputeAnomalyMetrics, ComputeSimilarity, eval_logit_processor
+ from .trainer import CustomSeq2SeqTrainer
+@@ -43,6 +48,15 @@ if TYPE_CHECKING:
+ logger = get_logger(__name__)
+ 
+ 
++def _freeze_loaded_modules_to_save(model) -> list[str]:
++    frozen = []
++    for name, parameter in model.named_parameters():
++        if "modules_to_save." in name:
++            parameter.requires_grad_(False)
++            frozen.append(name)
++    return frozen
++
++
+ def run_sft(
+     model_args: "ModelArguments",
+     data_args: "DataArguments",
+@@ -61,6 +75,9 @@ def run_sft(
+     template = get_template_and_fix_tokenizer(tokenizer, data_args)
+     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="sft", **tokenizer_module)
+     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
++    if model_args.freeze_loaded_adapter_modules_to_save:
++        frozen = _freeze_loaded_modules_to_save(model)
++        logger.info_rank0(f"Frozen {len(frozen)} inherited PEFT modules_to_save tensors; LoRA remains trainable.")
+     if model_args.sensor_fusion:
+         sensor_checkpoint = model_args.sensor_adapter_path
+         if sensor_checkpoint is None and model_args.adapter_name_or_path:
+@@ -94,18 +111,51 @@ def run_sft(
+             temporal_stride=model_args.sensor_temporal_stride,
+             distillation_loss_weight=model_args.distillation_loss_weight,
+             distillation_temperature=model_args.distillation_temperature,
++            language_model_loss_weight=model_args.language_model_loss_weight,
++            replay_loss_weight=model_args.replay_loss_weight,
++            replay_consistency_weight=model_args.replay_consistency_weight,
+             consistency_loss_weight=model_args.consistency_loss_weight,
+             consistency_sensor_dropout_probability=model_args.consistency_sensor_dropout_probability,
+         )
++    elif model_args.multimodal_auxiliary_head:
++        auxiliary_checkpoint = model_args.sensor_adapter_path
++        if auxiliary_checkpoint is None and model_args.adapter_name_or_path:
++            auxiliary_checkpoint = model_args.adapter_name_or_path[-1]
++        attach_multimodal_auxiliary_heads(
++            model,
++            adapter_path=auxiliary_checkpoint,
++            anomaly_head=model_args.anomaly_head,
++            export_fused_embeddings=model_args.export_fused_embeddings,
++            task_aware_head=model_args.task_aware_head,
++            export_task_outputs=model_args.export_task_outputs,
++            num_task_labels=model_args.num_task_labels,
++            num_action_labels=model_args.num_action_labels,
++            num_object_labels=model_args.num_object_labels,
++            task_embedding_dim=model_args.task_embedding_dim,
++            task_loss_weight=model_args.task_loss_weight,
++            action_loss_weight=model_args.action_loss_weight,
++            object_loss_weight=model_args.object_loss_weight,
++            relation_distillation_loss_weight=model_args.relation_distillation_loss_weight,
++            previous_edge_consistency_loss_weight=model_args.previous_edge_consistency_loss_weight,
++            disagreement_loss_weight=model_args.disagreement_loss_weight,
++            anomaly_loss_weight=model_args.anomaly_loss_weight,
++            anomaly_positive_weight=model_args.anomaly_positive_weight,
++            distillation_loss_weight=model_args.distillation_loss_weight,
++            distillation_temperature=model_args.distillation_temperature,
++            language_model_loss_weight=model_args.language_model_loss_weight,
++            replay_loss_weight=model_args.replay_loss_weight,
++            replay_consistency_weight=model_args.replay_consistency_weight,
++        )
+ 
+     if getattr(model, "is_quantized", False) and not training_args.do_train:
+         setattr(model, "_hf_peft_config_loaded", True)  # hack here: make model compatible with prediction
+ 
+-    collator_class = (
+-        SensorFusionSFTDataCollatorWith4DAttentionMask
+-        if model_args.sensor_fusion
+-        else SFTDataCollatorWith4DAttentionMask
+-    )
++    if model_args.sensor_fusion:
++        collator_class = SensorFusionSFTDataCollatorWith4DAttentionMask
++    elif model_args.multimodal_auxiliary_head:
++        collator_class = MultimodalAuxiliarySFTDataCollatorWith4DAttentionMask
++    else:
++        collator_class = SFTDataCollatorWith4DAttentionMask
+     sensor_collator_kwargs = {}
+     if model_args.sensor_fusion:
+         sensor_collator_kwargs = {
+@@ -160,6 +210,8 @@ def run_sft(
+         trainer.save_model()
+         if model_args.sensor_fusion:
+             save_sensor_fusion(model, training_args.output_dir)
++        elif model_args.multimodal_auxiliary_head:
++            save_multimodal_auxiliary_heads(model, training_args.output_dir)
+         if finetuning_args.include_effective_tokens_per_second:
+             train_result.metrics["effective_tokens_per_sec"] = calculate_tps(
+                 dataset_module["train_dataset"], train_result.metrics, stage="sft"
+diff --git a/src/llamafactory/model/model_utils/feedback_distillation.py b/src/llamafactory/model/model_utils/feedback_distillation.py
+new file mode 100644
+index 00000000..b2b03ecd
+--- /dev/null
++++ b/src/llamafactory/model/model_utils/feedback_distillation.py
+@@ -0,0 +1,57 @@
++from __future__ import annotations
++
++import torch
++from torch.nn import functional as F
++
++
++def binary_soft_target_kd(
++    student_logits: torch.Tensor,
++    teacher_probabilities: torch.Tensor,
++    temperature: float,
++    quality_weights: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Exact teacher-to-student Bernoulli KL at the registered temperature."""
++    valid = teacher_probabilities.ge(0)
++    if not valid.any():
++        return student_logits.sum() * 0
++    tau = max(float(temperature), 1e-6)
++    teacher = teacher_probabilities[valid].float().to(student_logits.device).clamp(1e-6, 1 - 1e-6)
++    softened_teacher = torch.sigmoid(torch.logit(teacher) / tau)
++    teacher_distribution = torch.stack((1 - softened_teacher, softened_teacher), dim=-1)
++    student_log_distribution = torch.log_softmax(
++        torch.stack((torch.zeros_like(student_logits[valid]), student_logits[valid]), dim=-1) / tau,
++        dim=-1,
++    )
++    per_sample = F.kl_div(student_log_distribution, teacher_distribution, reduction="none").sum(dim=-1)
++    if quality_weights is None:
++        return per_sample.mean()
++    weights = quality_weights.float().to(per_sample.device)[valid].clamp_min(0)
++    if weights.sum() <= 0:
++        return student_logits.sum() * 0
++    return (per_sample * weights).sum() / weights.sum()
++
++
++def replay_detection_loss(
++    student_logits: torch.Tensor,
++    replay_labels: torch.Tensor,
++    previous_probabilities: torch.Tensor | None,
++    *,
++    positive_weight: float,
++    consistency_weight: float,
++) -> torch.Tensor:
++    valid = replay_labels.ge(0)
++    if not valid.any():
++        return student_logits.sum() * 0
++    labels = replay_labels.float().to(student_logits.device)
++    loss = F.binary_cross_entropy_with_logits(
++        student_logits[valid], labels[valid],
++        pos_weight=student_logits.new_tensor(float(positive_weight)),
++    )
++    if previous_probabilities is not None:
++        previous = previous_probabilities.float().to(student_logits.device)
++        protected = valid & previous.ge(0)
++        if protected.any():
++            loss = loss + float(consistency_weight) * F.mse_loss(
++                torch.sigmoid(student_logits[protected]), previous[protected]
++            )
++    return loss
+diff --git a/src/llamafactory/model/model_utils/multimodal_auxiliary.py b/src/llamafactory/model/model_utils/multimodal_auxiliary.py
+new file mode 100644
+index 00000000..fe80bb17
+--- /dev/null
++++ b/src/llamafactory/model/model_utils/multimodal_auxiliary.py
+@@ -0,0 +1,283 @@
++"""Sensorless auxiliary heads over pooled multimodal language-model states."""
++
++from __future__ import annotations
++
++from pathlib import Path
++from types import MethodType
++from typing import Any, Optional
++
++import torch
++from torch import nn
++from torch.nn import functional as F
++
++from .feedback_distillation import binary_soft_target_kd, replay_detection_loss
++from .sensor_fusion import _text_hidden_size, compute_anomaly_pool_positions
++
++
++class MultimodalAuxiliaryHeads(nn.Module):
++    """Detection and task heads that consume a pooled video/audio/text state."""
++
++    def __init__(
++        self,
++        input_dim: int,
++        task_embedding_dim: int,
++        num_task_labels: int,
++        num_action_labels: int,
++        num_object_labels: int,
++        anomaly_head: bool,
++        task_aware_head: bool,
++    ) -> None:
++        super().__init__()
++        self.input_dim = input_dim
++        self.task_embedding_dim = task_embedding_dim
++        self.num_task_labels = num_task_labels
++        self.num_action_labels = num_action_labels
++        self.num_object_labels = num_object_labels
++        self.anomaly_head = nn.Linear(input_dim, 1) if anomaly_head else None
++        if task_aware_head:
++            self.task_projection = nn.Sequential(nn.Linear(input_dim, task_embedding_dim), nn.LayerNorm(task_embedding_dim))
++            self.task_classifier = nn.Linear(task_embedding_dim, num_task_labels)
++            self.action_classifier = nn.Linear(task_embedding_dim, num_action_labels)
++            self.object_classifier = nn.Linear(task_embedding_dim, num_object_labels)
++            self.disagreement_head = nn.Linear(task_embedding_dim + 1, 1)
++        else:
++            self.task_projection = None
++            self.task_classifier = None
++            self.action_classifier = None
++            self.object_classifier = None
++            self.disagreement_head = None
++
++
++def _masked_bce(logits: torch.Tensor, labels: torch.Tensor, positive_weight: float) -> Optional[torch.Tensor]:
++    labels = labels.float().to(logits.device)
++    valid = labels.ge(0)
++    if not valid.any():
++        return None
++    return F.binary_cross_entropy_with_logits(
++        logits[valid], labels[valid], pos_weight=logits.new_tensor(float(positive_weight))
++    )
++
++
++def _masked_ce(logits: torch.Tensor, labels: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
++    if labels is None:
++        return None
++    labels = labels.long().to(logits.device)
++    valid = labels.ge(0)
++    if not valid.any():
++        return None
++    return F.cross_entropy(logits[valid], labels[valid])
++
++
++def attach_multimodal_auxiliary_heads(
++    model: nn.Module,
++    adapter_path: Optional[str] = None,
++    anomaly_head: bool = True,
++    export_fused_embeddings: bool = False,
++    task_aware_head: bool = False,
++    export_task_outputs: bool = False,
++    num_task_labels: int = 0,
++    num_action_labels: int = 0,
++    num_object_labels: int = 0,
++    task_embedding_dim: int = 256,
++    task_loss_weight: float = 0.2,
++    action_loss_weight: float = 0.1,
++    object_loss_weight: float = 0.1,
++    relation_distillation_loss_weight: float = 0.0,
++    previous_edge_consistency_loss_weight: float = 0.0,
++    disagreement_loss_weight: float = 0.0,
++    anomaly_loss_weight: float = 1.0,
++    anomaly_positive_weight: float = 1.0,
++    distillation_loss_weight: float = 0.0,
++    distillation_temperature: float = 1.0,
++    language_model_loss_weight: float = 1.0,
++    replay_loss_weight: float = 0.0,
++    replay_consistency_weight: float = 0.5,
++) -> nn.Module:
++    """Patch a model so auxiliary losses use its native multimodal hidden states."""
++
++    if hasattr(model, "reassemble_multimodal_auxiliary_heads"):
++        return model
++    heads = MultimodalAuxiliaryHeads(
++        _text_hidden_size(model), task_embedding_dim, num_task_labels, num_action_labels,
++        num_object_labels, anomaly_head, task_aware_head,
++    )
++    model.add_module("reassemble_multimodal_auxiliary_heads", heads)
++    model.reassemble_export_fused_embeddings = export_fused_embeddings
++    model.reassemble_export_task_outputs = export_task_outputs
++    model.reassemble_task_loss_weight = task_loss_weight
++    model.reassemble_action_loss_weight = action_loss_weight
++    model.reassemble_object_loss_weight = object_loss_weight
++    model.reassemble_relation_distillation_loss_weight = relation_distillation_loss_weight
++    model.reassemble_previous_edge_consistency_loss_weight = previous_edge_consistency_loss_weight
++    model.reassemble_disagreement_loss_weight = disagreement_loss_weight
++    model.reassemble_anomaly_loss_weight = anomaly_loss_weight
++    model.reassemble_anomaly_positive_weight = anomaly_positive_weight
++    model.reassemble_distillation_loss_weight = distillation_loss_weight
++    model.reassemble_distillation_temperature = distillation_temperature
++    model.reassemble_language_model_loss_weight = language_model_loss_weight
++    model.reassemble_replay_loss_weight = replay_loss_weight
++    model.reassemble_replay_consistency_weight = replay_consistency_weight
++    model.reassemble_relation_memory_student = None
++    model.reassemble_relation_memory_teacher = None
++    original_forward = model.forward
++
++    def auxiliary_forward(
++        this,
++        input_ids=None,
++        anomaly_labels=None,
++        teacher_scores=None,
++        task_labels=None,
++        action_labels=None,
++        object_labels=None,
++        active_task_masks=None,
++        previous_edge_scores=None,
++        teacher_embeddings=None,
++        teacher_quality_weights=None,
++        disagreement_labels=None,
++        replay_labels=None,
++        anomaly_pool_positions=None,
++        return_anomaly_logits=False,
++        return_fused_embedding=False,
++        **kwargs,
++    ):
++        heads = this.reassemble_multimodal_auxiliary_heads
++        compute_auxiliary = heads.anomaly_head is not None and (
++            anomaly_labels is not None or return_anomaly_logits or return_fused_embedding
++        )
++        if compute_auxiliary:
++            kwargs["output_hidden_states"] = True
++        outputs = original_forward(input_ids=input_ids, **kwargs)
++        if not compute_auxiliary:
++            return outputs
++
++        attention_mask = kwargs.get("attention_mask")
++        labels = kwargs.get("labels")
++        if anomaly_pool_positions is None:
++            if labels is not None:
++                anomaly_pool_positions = compute_anomaly_pool_positions(labels, attention_mask)
++            elif attention_mask is not None:
++                anomaly_pool_positions = attention_mask.long().sum(dim=1).sub(1).clamp_min(0)
++            else:
++                anomaly_pool_positions = input_ids.new_full((input_ids.shape[0],), input_ids.shape[1] - 1)
++        hidden = outputs.hidden_states[-1]
++        positions = anomaly_pool_positions.to(hidden.device).long()
++        fused = hidden[torch.arange(positions.shape[0], device=positions.device), positions]
++        anomaly_logits = heads.anomaly_head(fused.float()).squeeze(-1)
++        # Preserve Transformers' ModelOutput type. Generation accesses cache fields
++        # through attributes (for example ``outputs.past_key_values``); converting
++        # it to a plain dict breaks autoregressive prediction even though training
++        # and non-generative evaluation continue to work.
++        outputs["anomaly_logits"] = anomaly_logits
++        if return_fused_embedding:
++            outputs["fused_embedding"] = fused
++
++        task_embedding = None
++        if heads.task_projection is not None:
++            task_embedding = F.normalize(heads.task_projection(fused.float()), dim=-1)
++            task_logits = heads.task_classifier(task_embedding)
++            if active_task_masks is not None:
++                active_mask = active_task_masks.bool().to(task_logits.device).clone()
++                if this.training and task_labels is not None:
++                    targets = task_labels.long().to(task_logits.device)
++                    valid = targets.ge(0) & targets.lt(active_mask.shape[-1])
++                    if valid.any():
++                        rows = torch.arange(active_mask.shape[0], device=active_mask.device)[valid]
++                        active_mask[rows, targets[valid]] = True
++                task_logits = task_logits.masked_fill(~active_mask, torch.finfo(task_logits.dtype).min)
++            action_logits = heads.action_classifier(task_embedding)
++            object_logits = heads.object_classifier(task_embedding)
++            disagreement_logits = heads.disagreement_head(
++                torch.cat([task_embedding, anomaly_logits.detach().unsqueeze(-1)], dim=-1)
++            ).squeeze(-1)
++            for key, value in {
++                "task_embedding": task_embedding,
++                "task_logits": task_logits,
++                "action_logits": action_logits,
++                "object_logits": object_logits,
++                "disagreement_logits": disagreement_logits,
++            }.items():
++                outputs[key] = value
++
++        if labels is None:
++            return outputs
++        if this.reassemble_language_model_loss_weight == 0:
++            total_loss = anomaly_logits.float().sum() * 0.0
++        else:
++            total_loss = outputs["loss"] * this.reassemble_language_model_loss_weight
++        if anomaly_labels is not None:
++            anomaly_loss = _masked_bce(anomaly_logits, anomaly_labels, this.reassemble_anomaly_positive_weight)
++            if anomaly_loss is not None:
++                total_loss = total_loss + this.reassemble_anomaly_loss_weight * anomaly_loss
++        if task_embedding is not None:
++            for logits, targets, weight in [
++                (task_logits, task_labels, this.reassemble_task_loss_weight),
++                (action_logits, action_labels, this.reassemble_action_loss_weight),
++                (object_logits, object_labels, this.reassemble_object_loss_weight),
++            ]:
++                auxiliary_loss = _masked_ce(logits, targets)
++                if auxiliary_loss is not None:
++                    total_loss = total_loss + weight * auxiliary_loss
++            if this.training and disagreement_labels is not None and this.reassemble_disagreement_loss_weight > 0:
++                disagreement_loss = _masked_bce(disagreement_logits, disagreement_labels, 1.0)
++                if disagreement_loss is not None:
++                    total_loss = total_loss + this.reassemble_disagreement_loss_weight * disagreement_loss
++        if this.training and teacher_scores is not None and this.reassemble_distillation_loss_weight > 0:
++            temperature = max(float(this.reassemble_distillation_temperature), 1e-6)
++            kd_loss = binary_soft_target_kd(
++                anomaly_logits, teacher_scores, temperature, teacher_quality_weights
++            )
++            total_loss = total_loss + this.reassemble_distillation_loss_weight * (temperature**2) * kd_loss
++        if this.training and previous_edge_scores is not None and this.reassemble_previous_edge_consistency_loss_weight > 0:
++            previous = previous_edge_scores.float().to(anomaly_logits.device)
++            protected = previous.ge(0)
++            if protected.any():
++                total_loss = total_loss + this.reassemble_previous_edge_consistency_loss_weight * F.mse_loss(
++                    torch.sigmoid(anomaly_logits[protected]), previous[protected]
++                )
++        if this.training and replay_labels is not None and this.reassemble_replay_loss_weight > 0:
++            replay_loss = replay_detection_loss(
++                anomaly_logits, replay_labels, previous_edge_scores,
++                positive_weight=this.reassemble_anomaly_positive_weight,
++                consistency_weight=this.reassemble_replay_consistency_weight,
++            )
++            total_loss = total_loss + this.reassemble_replay_loss_weight * replay_loss
++        if this.training and teacher_embeddings is not None and this.reassemble_relation_distillation_loss_weight > 0:
++            teacher_embeddings = teacher_embeddings.float().to(fused.device)
++            valid = torch.isfinite(teacher_embeddings).all(dim=1) & teacher_embeddings.norm(dim=1).gt(0)
++            if valid.sum() > 1:
++                student_embed = F.normalize(fused[valid].float(), dim=-1)
++                teacher_embed = F.normalize(teacher_embeddings[valid], dim=-1)
++                relation_loss = F.mse_loss(student_embed @ student_embed.T, teacher_embed @ teacher_embed.T)
++                total_loss = total_loss + this.reassemble_relation_distillation_loss_weight * relation_loss
++        outputs["loss"] = total_loss
++        return outputs
++
++    model.forward = MethodType(auxiliary_forward, model)
++    if adapter_path:
++        load_multimodal_auxiliary_heads(model, adapter_path)
++    return model
++
++
++def save_multimodal_auxiliary_heads(model: nn.Module, output_dir: str) -> Path:
++    module = model.reassemble_multimodal_auxiliary_heads
++    path = Path(output_dir) / "auxiliary_heads.pt"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    torch.save({
++        "input_dim": module.input_dim,
++        "task_embedding_dim": module.task_embedding_dim,
++        "num_task_labels": module.num_task_labels,
++        "num_action_labels": module.num_action_labels,
++        "num_object_labels": module.num_object_labels,
++        "state_dict": {key: value.detach().cpu() for key, value in module.state_dict().items()},
++    }, path)
++    return path
++
++
++def load_multimodal_auxiliary_heads(model: nn.Module, path_or_dir: str) -> None:
++    path = Path(path_or_dir)
++    if path.is_dir():
++        path = path / "auxiliary_heads.pt"
++    if not path.exists():
++        raise FileNotFoundError(f"Multimodal auxiliary checkpoint not found: {path}")
++    payload: dict[str, Any] = torch.load(path, map_location="cpu", weights_only=True)
++    model.reassemble_multimodal_auxiliary_heads.load_state_dict(payload["state_dict"])

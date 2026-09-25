@@ -1,0 +1,8 @@
+{
+  "format": "NPZ",
+  "sensor": "float32 array with shape [time, channels]",
+  "mask": "boolean array with shape [time]",
+  "reassemble_channels": 52,
+  "imperfectpour_channels": 44,
+  "sensor_tokens": 8
+}

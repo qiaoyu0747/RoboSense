@@ -1,126 +1,90 @@
 # RoboSense
 
-### An Edge–Cloud Collaborative Framework for Multimodal Robot Failure Detection
+Minimal research code for multimodal edge–cloud robot failure detection.
 
-RoboSense combines lightweight edge inference, net-benefit-based cloud routing, and continual cloud-to-edge adaptation for robot execution monitoring. It uses multimodal observations to detect failures and produce structured analyses with temporal localization, supporting evidence, and recovery suggestions.
+RoboSense fine-tunes a Qwen2.5-Omni-3B edge model and a Qwen2.5-Omni-7B cloud model, predicts the expected correction benefit of cloud verification, and periodically adapts the edge model using reliable cloud knowledge distillation and historical replay.
 
+This repository contains method code and sanitized configurations only. Datasets, model weights, checkpoints, predictions, telemetry, and baseline implementations are not redistributed.
 
-> **Release status:** This package contains project documentation and a repository scaffold. Implementation, model weights, datasets, and executable reproduction commands are not included. Results below are reported in the manuscript; they have not been reproduced by this package.
+## Method
 
-## Key features
+1. **Multimodal detection.** Edge-3B and Cloud-7B produce anomaly probabilities and 256-dimensional fused representations.
+2. **Sensor fusion.** Robot time series are encoded into eight learned tokens. REASSEMBLE additionally includes a structured sensor summary in the prompt.
+3. **Net-benefit routing.** Two calibrated classifiers estimate whether cloud inference will correct an edge error or harm a correct edge decision. The routing score is `P(fix) - P(harm)`.
+4. **Cloud-to-edge adaptation.** Correct Cloud-7B predictions with confidence at least 0.7 provide KD targets. Edge-3B updates LoRA and task heads using supervised loss, KD, and seen-training replay.
 
-- **Multimodal monitoring:** combines video, audio, and proprioceptive signals, according to dataset availability.
-- **Lightweight edge inference:** supports local failure detection during robot execution.
-- **Net-benefit routing:** selectively requests cloud assistance based on its anticipated benefit relative to offloading cost.
-- **Continual adaptation:** transfers cloud knowledge to the edge through knowledge distillation and historical replay.
-- **Structured failure reasoning:** provides temporal localization, evidence, and recovery suggestions.
+Routing uses only edge probability, confidence, entropy, task-conditioned OOD distance, and a 16-dimensional PCA projection of the fused edge representation. Latency, energy, bandwidth, and payload size are evaluation outcomes, not router inputs.
 
-## Framework overview
+## Dataset interfaces
 
-```mermaid
-flowchart LR
-    A[Multimodal observations] --> B[Lightweight edge inference]
-    B --> C[Net-benefit routing]
-    C -->|Local decision| D[Failure detection output]
-    C -->|Selective offload| E[Cloud inference and reasoning]
-    E --> D
-    E --> F[Temporal localization, evidence, recovery suggestions]
-    E --> G[Knowledge distillation and historical replay]
-    G -.->|Continual adaptation| B
+| Dataset | Inputs |
+|---|---|
+| REASSEMBLE | Video, audio, sensor summary, eight learned sensor tokens, task text |
+| RoboFAC | Synchronized RGB views and task text |
+| FAILURE | Video, audio and task text |
+| ImperfectPour | Video, eight learned proprioception tokens and task text |
+
+## Installation
+
+The completed experiments used Transformers 4.55.0 and LLaMA-Factory commit `7e24047c97d34c99c21faf11991959a6a3cb9134`.
+
+```bash
+python -m pip install -r requirements.txt
+git clone https://github.com/hiyouga/LLaMA-Factory.git third_party/LLaMA-Factory
+git -C third_party/LLaMA-Factory checkout 7e24047c97d34c99c21faf11991959a6a3cb9134
+git -C third_party/LLaMA-Factory apply ../../patches/llamafactory-robosense.patch
+python -m pip install -e third_party/LLaMA-Factory
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 ```
 
-The edge model evaluates incoming observations. The routing component determines when cloud assistance is useful. Cloud feedback supports detailed failure analysis and continual edge adaptation. This diagram is a conceptual overview, not an implementation specification.
+The patch is extracted from the training implementation used in the completed experiments. It adds multimodal anomaly/task heads, sensor-token injection, KD/replay metadata collation, auxiliary checkpoint handling, and anomaly-AUPRC checkpoint selection.
 
-## Datasets
+## Configuration
 
-The manuscript evaluates RoboSense on four datasets with the following episode-level splits:
+Set external paths rather than editing source files:
 
-| Dataset | Training | Deployment | ID test | OOD test |
-| --- | ---: | ---: | ---: | ---: |
-| REASSEMBLE | 1,935 | 111 | 425 | 84 |
-| RoboFAC | 2,220 | 392 | 5,534 | 1,186 |
-| ImperfectPour | 193 | 64 | 89 | 59 |
-| FAILURE | 80 | 31 | 32 | 29 |
-
-ID and OOD denote in-distribution and out-of-distribution evaluation. Dataset files are not redistributed in this package. Access instructions, licensing information, preprocessing details, and split manifests are pending; see [dataset documentation](docs/datasets.md).
-
-## Results summary
-
-| Measure | Manuscript-reported result | Scope |
-| --- | --- | --- |
-| Overall Macro F1 | 76.1–80.1% | Range across four datasets |
-| End-to-end latency reduction | 61.7% | Average across four datasets vs. cloud-only inference |
-| Communication cost reduction | 99.3% | Average across four datasets vs. cloud-only inference |
-| Explanation correctness | 82.1% | Structured failure analysis evaluation |
-| Evidence grounding | 76.5% | Structured failure analysis evaluation |
-
-These values summarize the manuscript and do not imply that all metrics share the same evaluation subset. Exact protocols, hardware, metric definitions, and per-dataset results should be read alongside the anonymized paper. See [results documentation](docs/results.md) for outstanding reproduction details.
-
-## Repository layout
-
-```text
-robosense-anonymous/
-├── README.md
-├── .gitignore
-├── LICENSE.placeholder
-├── citation.bib
-├── assets/
-│   └── README.md
-├── configs/
-│   └── README.md
-├── scripts/
-│   └── README.md
-├── src/
-│   └── README.md
-├── data/
-│   └── README.md
-└── docs/
-    ├── setup.md
-    ├── usage.md
-    ├── datasets.md
-    ├── results.md
-    └── anonymity.md
+```bash
+export ROBOSENSE_DATA_ROOT=/path/to/datasets
+export ROBOSENSE_DATASET_DIR=/path/to/llamafactory/data
+export ROBOSENSE_OUTPUT_ROOT=/path/to/outputs
+export ROBOSENSE_EDGE_MODEL=Qwen/Qwen2.5-Omni-3B
+export ROBOSENSE_CLOUD_MODEL=Qwen/Qwen2.5-Omni-7B
+export ROBOSENSE_SENSOR_PRETRAINED=/path/to/reassemble_sensor_encoder.pt
 ```
 
-## Installation and setup
+Register the dataset names referenced by `configs/*.yaml` in LLaMA-Factory's `dataset_info.json`. See [data format](docs/DATA_FORMAT.md) and [configuration](docs/CONFIGURATION.md).
 
-**Placeholder — implementation release pending.**
+## Commands
 
-1. Obtain the anonymous repository archive and extract it.
-2. Follow [setup documentation](docs/setup.md) once the supported environment and dependency versions are supplied.
-3. Obtain permitted datasets and model weights using the forthcoming access instructions.
-4. Configure local data locations and cloud access using the forthcoming configuration template.
+```bash
+python -m robosense.cli audit --manifest /path/to/manifest.jsonl
+bash scripts/train_edge.sh reassemble
+bash scripts/train_cloud.sh reassemble
+bash scripts/fit_router.sh predictions.jsonl outputs/reassemble/router.joblib
+bash scripts/adapt_edge.sh predictions.jsonl outputs/reassemble/router.joblib \
+  outputs/reassemble/adaptation 0.50
+bash scripts/evaluate.sh final_predictions.jsonl outputs/reassemble/metrics.json
+```
 
-There is currently no installation command or runnable package. Required software versions, hardware requirements, dependency files, model identifiers, and cloud configuration remain to be supplied.
+The generated feedback and replay records are consumed by the patched LLaMA-Factory training path with `language_model_loss_weight: 0`, `distillation_loss_weight: 0.25`, `distillation_temperature: 2`, and `replay_loss_weight: 0.5`.
 
-## Usage
+## Repository contents
 
-**Placeholder — commands will accompany the implementation.**
+- `robosense/models`: exact sensor encoder, multimodal heads, KD and replay losses extracted from the completed implementation.
+- `robosense/routing`: net-benefit feature construction, cross-fitted correction/harm classifiers and exact-budget routing.
+- `robosense/adaptation`: reliable teacher filtering and deterministic historical replay.
+- `robosense/evaluation`: detection metrics, threshold selection and grouped bootstrap utilities.
+- `patches`: integration with the pinned LLaMA-Factory revision.
+- `configs`: sanitized versions of the four dataset training configurations.
 
-The intended workflow is data preparation, edge inference, selective cloud routing, cloud-to-edge adaptation, and evaluation. See [usage documentation](docs/usage.md) for the planned entry points and expected documentation. No example command in this release should be treated as executable.
+## Third-party software
+
+RoboSense builds on [Qwen2.5-Omni](https://huggingface.co/collections/Qwen/qwen25-omni-67de7e5e3ba8e47b585c5eb8) and [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory). Their respective licenses and model terms continue to apply. Dataset licenses are not changed by this code release.
 
 ## Citation
 
-For the review version, use this anonymous placeholder. Replace the title, year, and paper URL with the corresponding anonymous submission details before use.
-
-```bibtex
-@misc{robosense_anonymous,
-  author = {{}},
-  title  = {{RoboSense}: [An Edge–Cloud Collaborative Framework for Multimodal Robot Failure Detection]},
-  year   = {YYYY},
-  note   = {Anonymous submission under review},
-  url    = {ANONYMOUS_PAPER_URL}
-}
-```
-
-The same entry is available in [citation.bib](citation.bib).
+The paper citation will be added after publication. For the software release, use [citation.bib](citation.bib).
 
 ## License
 
-**License selection pending.** [LICENSE.placeholder](LICENSE.placeholder) is a reminder to add the intended license; it is not a license grant. Dataset and model terms must be documented separately when those resources are added.
-
-## Anonymity note
-
-This scaffold intentionally omits author identities, affiliations, contact details, account handles, institutional identifiers, and links to non-anonymous project pages. The archive contains no Git history, source attachments, embedded media, or tracking badges. The paper URL remains a placeholder until an anonymized review copy is available.
-
-Before adding files or publishing the repository, review [the anonymity checklist](docs/anonymity.md), including the paper's metadata and any repository history. Hosting account and platform metadata must also preserve anonymity.
+RoboSense-specific code is released under the MIT License. Third-party code and models remain under their original terms.
